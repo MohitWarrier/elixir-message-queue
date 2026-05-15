@@ -1,0 +1,43 @@
+# The directory Mix will write compiled artifacts to.
+/_build/
+
+# If you run "mix test --cover", coverage assets end up here.
+/cover/
+
+# The directory Mix downloads your dependencies sources to.
+/deps/
+
+# Where third-party dependencies like ExDoc output generated docs.
+/doc/
+
+# Temporary files, for example, from tests.
+/tmp/
+
+# If the VM crashes, it generates a dump, let's ignore it too.
+erl_crash.dump
+
+# Also ignore archive artifacts (built via "mix archive.build").
+*.ez
+
+# Ignore package tarball (built via "mix hex.build").
+message_queue-*.tar
+
+# Language server / editor workspaces
+/.elixir_ls/
+/.lexical/
+/.vscode/
+/.idea/
+
+# Secret config files
+/config/*.secret.exs
+
+# Durable queue logs (created at runtime in Phase 6).
+/priv/logs/
+
+# Windows OS files
+Thumbs.db
+Desktop.ini
+
+# Local Claude project instructions
+CLAUDE.md
+
