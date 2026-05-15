@@ -24,18 +24,12 @@ defmodule MessageQueue.Queue do
            but you don't have a Registry running yet. Phase 5 sets it up.
       Pick (a) for now; you'll migrate in Phase 5.
   """
-  def start_link(name) when is_binary(name) do
-    GenServer.start_link(__MODULE__, nil, name: via(name))
+  def start_link(name, opts \\ []) when is_binary(name) do
+    GenServer.start_link(__MODULE__, opts, name: via(name))
   end
 
   @doc """
   Publish a message. Returns `:ok`.
-
-  Decision: call or cast?
-    - cast = fire-and-forget. Faster, but the publisher gets no confirmation
-      that the queue actually received the message.
-    - call = publisher blocks until the queue has accepted it.
-    - Both are defensible. Pick one and leave a 1-line comment justifying it.
   """
   def publish(name, message) do
     GenServer.call(via(name), {:publish, message})
@@ -57,12 +51,7 @@ defmodule MessageQueue.Queue do
 
   @doc """
   Ack a delivery. The message is gone for good.
-
-  Decision: what if the tag is unknown (already acked, never existed)?
-    - return `:ok` silently (forgiving — what SQS does)
-    - return `{:error, :unknown_tag}` (strict)
-    - crash the GenServer (RabbitMQ-style: it's a protocol violation)
-  Pick one. Document why.
+  Returns {:error, :unknown_tag} if tag doesnt exist
   """
   def ack(name, delivery_tag) do
     GenServer.call(via(name), {:ack, delivery_tag})
@@ -70,11 +59,7 @@ defmodule MessageQueue.Queue do
 
   @doc """
   Nack a delivery.
-
-  Options:
-    - `requeue: true` (default) → return the message to the queue.
-       Sub-decision: head or tail? Head = retry immediately; tail = let
-       other messages go first. Most queues use the head. Pick one.
+       on retry message send to tail
     - `requeue: false` → drop the message. (Phase 3: route to DLQ instead.)
   """
   def nack(name, delivery_tag, opts \\ []) do
@@ -89,23 +74,19 @@ defmodule MessageQueue.Queue do
   #  --- GenServer callbacks ---
 
   @impl true
-  def init(_init_arg) do
-    # TODO: build the minimal state.
-    #
-    # Shape hints (no logic — just the data):
-    #   - pending FIFO: Erlang's `:queue` module gives you O(1) push/pop at
-    #     both ends. `:queue.new/0`, `:queue.in/2`, `:queue.out/1`. A plain
-    #     list works too but you'll fight reverse() at some point.
-    #   - in-flight: `%{delivery_tag => message}` — O(1) ack/nack lookup.
-    #
-    # Phase 2 will extend each in-flight entry with a deadline and an
-    # attempt_count. Don't add those fields yet — YAGNI.
-    {:ok, %{pending: :queue.new(), in_flight: %{}}}
+  def init(opts) do
+    {:ok,
+     %{
+       pending: :queue.new(),
+       in_flight: %{},
+       visibility_timeout: Keyword.get(opts, :visibility_timeout, 30_000)
+     }}
   end
 
   @impl true
   def handle_call({:publish, message}, _from, state) do
-    new_state = %{state | pending: :queue.in(message, state.pending)}
+    envelope = %{payload: message, attempt_count: 0}
+    new_state = %{state | pending: :queue.in(envelope, state.pending)}
     {:reply, :ok, new_state}
   end
 
@@ -115,13 +96,14 @@ defmodule MessageQueue.Queue do
       {:empty, _} ->
         {:reply, :empty, state}
 
-      {{:value, message}, rest} ->
+      {{:value, envelope}, rest} ->
         tag = make_ref()
 
         new_state =
-          %{state | pending: rest, in_flight: Map.put(state.in_flight, tag, message)}
+          %{state | pending: rest, in_flight: Map.put(state.in_flight, tag, envelope)}
 
-        {:reply, {:ok, message, tag}, new_state}
+        Process.send_after(self(), {:expire, tag}, state.visibility_timeout)
+        {:reply, {:ok, envelope.payload, tag}, new_state}
     end
   end
 
@@ -129,22 +111,26 @@ defmodule MessageQueue.Queue do
   def handle_call({:ack, tag}, _from, state) do
     case Map.pop(state.in_flight, tag) do
       {nil, _map} -> {:reply, {:error, :unknown_tag}, state}
-      {_message, rest} -> {:reply, :ok, %{state | in_flight: rest}}
+      {_envelope, rest} -> {:reply, :ok, %{state | in_flight: rest}}
     end
   end
 
   @impl true
   def handle_call({:nack, tag, opts}, _from, state) do
     case Map.pop(state.in_flight, tag) do
-      {nil, _map} ->
+      {nil, _rest} ->
         {:reply, {:error, :unknown_tag}, state}
 
-      {message, rest} ->
+      {envelope, rest} ->
         new_state = %{state | in_flight: rest}
 
         case Keyword.get(opts, :requeue, true) do
-          true -> {:reply, :ok, %{new_state | pending: :queue.in(message, new_state.pending)}}
-          false -> {:reply, :ok, new_state}
+          true ->
+            envelope = Map.update!(envelope, :attempt_count, fn val -> val + 1 end)
+            {:reply, :ok, %{new_state | pending: :queue.in(envelope, new_state.pending)}}
+
+          false ->
+            {:reply, :ok, new_state}
         end
     end
   end
@@ -152,6 +138,19 @@ defmodule MessageQueue.Queue do
   @impl true
   def handle_call(:size, _from, state) do
     {:reply, :queue.len(state.pending), state}
+  end
+
+  @impl true
+  def handle_info({:expire, tag}, state) do
+    case Map.pop(state.in_flight, tag) do
+      {nil, _rest} ->
+        {:noreply, state}
+
+      {envelope, rest} ->
+        new_state = %{state | in_flight: rest}
+        envelope = Map.update!(envelope, :attempt_count, fn val -> val + 1 end)
+        {:noreply, %{new_state | pending: :queue.in(envelope, new_state.pending)}}
+    end
   end
 
   #  --- Helpers ---

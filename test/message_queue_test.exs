@@ -159,5 +159,4 @@ defmodule MessageQueueTest do
       assert MessageQueue.Queue.size(q) == 1
     end
   end
-
 end
