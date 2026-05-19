@@ -17,19 +17,38 @@ defmodule MessageQueue do
   in the delivery tag. For now we pass it explicitly — simpler.)
   """
 
-  @doc "Publish a message to the named queue."
+  @doc "Publishes a message to the named queue. See `MessageQueue.Queue.publish/2`."
   defdelegate publish(queue, message), to: MessageQueue.Queue
 
   @doc """
-  Fetch the next message from the named queue.
+  Fetches the next message from the named queue.
 
-  Returns `{:ok, message, delivery_tag}` or `:empty`.
+  Returns `{:ok, message, delivery_tag}` or `:empty`. See
+  `MessageQueue.Queue.fetch/1` for delivery and ack semantics.
   """
-  defdelegate fetch(queue), to: MessageQueue.Queue
+  defdelegate fetch(queue, opts \\ []), to: MessageQueue.Queue
 
-  @doc "Ack a delivery. The message is permanently removed."
+  @doc "Acknowledges a delivery. See `MessageQueue.Queue.ack/2`."
   defdelegate ack(queue, delivery_tag), to: MessageQueue.Queue
 
-  @doc "Nack a delivery. `requeue: true` (default) puts the message back."
+  @doc """
+  Negatively acknowledges a delivery. `requeue: true` (default) returns
+  the message to the queue; `requeue: false` routes it to the DLQ.
+  See `MessageQueue.Queue.nack/3`.
+  """
   defdelegate nack(queue, delivery_tag, opts \\ []), to: MessageQueue.Queue
+
+  @doc """
+  Returns the dead-letter queue's contents as a list, oldest first.
+  Read-only. See `MessageQueue.Queue.dlq_messages/1`.
+  """
+  defdelegate dlq_messages(queue), to: MessageQueue.Queue
+
+  def ensure_queue(queue, opts \\ []) do
+    case MessageQueue.QueueSupervisor.start_queue(queue, opts) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+      {:error, other} -> {:error, other}
+    end
+  end
 end

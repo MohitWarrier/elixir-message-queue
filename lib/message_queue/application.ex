@@ -1,6 +1,4 @@
 defmodule MessageQueue.Application do
-  # See https://hexdocs.pm/elixir/Application.html
-  # for more information on OTP Applications
   @moduledoc false
 
   use Application
@@ -8,12 +6,15 @@ defmodule MessageQueue.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # Starts a worker by calling: MessageQueue.Worker.start_link(arg)
-      # {MessageQueue.Worker, arg}
+      # The Registry that queue processes register themselves under.
+      # `keys: :unique` because each queue name maps to exactly one process.
+      {Registry, keys: :unique, name: MessageQueue.Registry},
+
+      # DynamicSupervisor that owns queue processes. Starts them on demand
+      # and restarts them automatically on crash.
+      MessageQueue.QueueSupervisor
     ]
 
-    # See https://hexdocs.pm/elixir/Supervisor.html
-    # for other strategies and supported options
     opts = [strategy: :one_for_one, name: MessageQueue.Supervisor]
     Supervisor.start_link(children, opts)
   end
