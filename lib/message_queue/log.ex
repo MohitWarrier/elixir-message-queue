@@ -76,15 +76,28 @@ defmodule MessageQueue.Log do
     * `{:fetch, tag, envelope}` — `envelope` moved from pending to in-flight
       under `tag` (a `make_ref/0` value).
     * `{:ack, tag}` — `tag` was acked; remove from in-flight.
-    * `{:nack, tag, opts}` — `tag` was nacked. `opts` is a keyword list with
-      `:requeue` (defaults to `true` if absent).
-    * `{:expire, tag}` — visibility timeout fired for `tag`. Replay applies
-      the same attempt-count + max_attempts decision the live handler made.
+    * `{:requeue, tag, envelope}` — nack with `requeue: true` that's still
+      under `max_attempts`. The live handler bumped `attempt_count` before
+      writing this entry, so `envelope` here already carries the new count.
+      Replay puts `envelope` back into pending.
+    * `{:dlq, tag, envelope}` — nack that hit `max_attempts`, OR a nack
+      with `requeue: false`. `envelope` carries whatever count the live
+      handler decided on (bumped for the max_attempts path, un-bumped for
+      the `requeue: false` path). Replay puts `envelope` into the DLQ.
+    * `{:requeue_from_expire, tag, envelope}` — visibility-timeout fired,
+      bumped count is still under `max_attempts`. Same effect as `:requeue`.
+    * `{:dlq_from_expire, tag, envelope}` — visibility-timeout fired,
+      bumped count hit `max_attempts`. Same effect as `:dlq`.
+
+  The live handler decides requeue-vs-DLQ before writing the entry, so
+  replay never re-derives that decision. This is deliberate: replay would
+  otherwise reach different conclusions if `max_attempts` changed between
+  runs.
 
   Unknown-tag ack/nack/expire operations are **not logged** — the live
-  handlers skip the log call in their unknown-tag branch. Why: replay would
-  fail (Map.pop on a missing key returns nil envelope, downstream code
-  crashes). Only state-changing operations land in the log.
+  handlers skip the log call in their unknown-tag branch. Why: replay
+  would fail (`Map.pop` on a missing key returns nil envelope, downstream
+  code crashes). Only state-changing operations land in the log.
 
   ## Reference values across restarts
 
@@ -252,13 +265,16 @@ defmodule MessageQueue.Log do
   @spec replay(String.t(), (entry(), acc -> acc), acc) :: {:ok, acc} | {:error, term()}
         when acc: term()
   def replay(queue_name, fun, initial) do
+    # The [:read, :write] mode creates the file if it doesn't exist
+    # (rather than returning :enoent), so we never fall through to an
+    # "no file, nothing to replay" branch — a brand-new queue just gets
+    # an empty file and do_replay's first :file.read returns :eof.
     with {:ok, path} <- path_for(queue_name),
          {:ok, fd} <- :file.open(path, [:read, :write, :raw, :binary]) do
       result = do_replay(fd, fun, initial)
       :file.close(fd)
       result
     else
-      {:error, :enoent} -> {:ok, initial}
       {:error, :invalid_name} -> {:error, :invalid_name}
     end
   end
@@ -295,7 +311,13 @@ defmodule MessageQueue.Log do
       {:ok, <<n::32-big-unsigned>>} ->
         case :file.read(fd, n) do
           {:ok, payload} when byte_size(payload) == n ->
-            entry = :erlang.binary_to_term(payload)
+            # `:safe` rejects atom names not already in the atom table and
+            # refuses to rebuild a function from the bytes. A tampered log
+            # could otherwise fill the (non-GC'd) atom table and crash the
+            # whole BEAM. All atoms our code legitimately writes are
+            # already loaded when Queue's module loads, so this rejects
+            # nothing real.
+            entry = :erlang.binary_to_term(payload, [:safe])
             new_acc = fun.(entry, acc)
             do_replay(fd, fun, new_acc, last_good_pos + 4 + n)
           _ -> # torn payload
@@ -303,9 +325,10 @@ defmodule MessageQueue.Log do
             {:ok, acc}
         end
 
-      _ -> # torn header
+      {:ok, _partial} -> # torn header
         truncate(fd, last_good_pos)
         {:ok, acc}
+      :eof -> {:ok, acc}
     end
   end
 

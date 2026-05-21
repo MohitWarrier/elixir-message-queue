@@ -29,8 +29,9 @@ defmodule MessageQueue.Queue do
   change is lost forever — disk has no record of it.
 
   Affected handlers: `publish`, `fetch` (success branch only), `ack`, `nack`,
-  and the `expire` info handler. Each guards the call with
-  `if state.log != nil` so non-durable queues skip logging at no cost.
+  and the `expire` info handler. Each routes its append through the
+  `log_op/2` helper, which is a no-op for non-durable queues (where
+  `state.log` is `nil`) and a `:ok = Log.append(...)` for durable ones.
 
   ### Crash recovery is a configurable data-loss window
 
@@ -157,14 +158,17 @@ defmodule MessageQueue.Queue do
   #  --- GenServer callbacks ---
 
   # Boot sequence (durable path):
-  #   1. Open the log file. Crash on error — broken durability is louder
-  #      than a queue that silently runs in-memory when the user asked for
-  #      durable.
-  #   2. Schedule the first fsync. The recurring timer is what protects
+  #   1. Replay the log on top of an empty state map. Log.replay/3 opens
+  #      the file in read+write mode (so it can truncate torn entries),
+  #      walks it via apply_helper/2, and closes its handle before
+  #      returning. Crash on error — broken durability is louder than
+  #      silently running in-memory.
+  #   2. Open the long-lived append handle via Log.open/1. By the time
+  #      this runs, replay's handle is already closed — so only ONE
+  #      handle to the file exists at any moment (Windows-safe).
+  #   3. Schedule the first fsync. The recurring timer is what protects
   #      against ungraceful crashes (kill, OOM, power loss); terminate/2
   #      only covers graceful shutdown.
-  #   3. Replay the log on top of an empty state map. apply_helper/2 is
-  #      the fold function — it knows how to apply each entry shape.
   #   4. Re-schedule :expire timers for every tag the replay restored to
   #      in_flight. The original timers died with the previous process.
   #      Without this, fetched-but-not-acked messages from before the
@@ -174,25 +178,21 @@ defmodule MessageQueue.Queue do
   #      fresh window.
   #
   # Note: max_attempts and visibility_timeout come from opts, not from the
-  # log. Restarting with different values changes how DLQ routing and
-  # redelivery decisions play out post-replay. This is a config-drift
-  # gotcha — if you depend on a specific max_attempts/timeout, ensure
-  # restarts use the same opts the original run did.
+  # log. Restarting with different values affects how future ops behave
+  # but does not change replayed state — the live handler resolves
+  # requeue-vs-DLQ before writing the entry, so replay just applies the
+  # recorded decision. This was the config-drift bug we fixed earlier.
   @impl true
   def init({name, opts}) do
-    {:ok, log} =
-      case Keyword.get(opts, :durable, false) do
-        true -> MessageQueue.Log.open(name)
-        false -> {:ok, nil}
-      end
-
+    durable? = Keyword.get(opts, :durable, false)
     fsync_interval = Keyword.get(opts, :fsync_interval, 100)
-    if log != nil, do: Process.send_after(self(), :fsync, fsync_interval)
 
+    # Build the empty state with log: nil. For durable queues we'll fill
+    # in the log handle AFTER replay finishes (see below).
     empty_state = %{
       pending: :queue.new(),
       dlq: :queue.new(),
-      log: log,
+      log: nil,
       max_attempts: Keyword.get(opts, :max_attempts, 5),
       in_flight: %{},
       visibility_timeout: Keyword.get(opts, :visibility_timeout, 30_000),
@@ -200,10 +200,25 @@ defmodule MessageQueue.Queue do
       waiters: :queue.new()
     }
 
-    if log == nil do
-      {:ok, empty_state}
-    else
+    if durable? do
+      # Order matters: replay → open → schedule timers.
+      #
+      # Why this order: Log.replay/3 opens the file in :read+:write mode
+      # so it can truncate torn entries. Log.open/1 opens the same file
+      # in :append mode for the live process. On Linux, having both
+      # handles open simultaneously is fine. On Windows, the second open
+      # can fail with :eacces depending on share-mode flags. By running
+      # replay first (open-use-close inside that single call) and only
+      # then opening the long-lived append handle, only ONE handle to the
+      # file exists at any moment. Cross-platform safe.
+      #
+      # Bonus: if do_replay truncates a torn entry, the file shrinks
+      # BEFORE the append handle opens — no risk of the append handle
+      # caching a stale view of file length.
       {:ok, rebuilt_state} = MessageQueue.Log.replay(name, &apply_helper/2, empty_state)
+      {:ok, log} = MessageQueue.Log.open(name)
+
+      Process.send_after(self(), :fsync, fsync_interval)
 
       # Replay restored messages into in_flight (fetched-but-not-acked
       # before the crash), but no expire timers exist for them — those
@@ -215,7 +230,9 @@ defmodule MessageQueue.Queue do
         Process.send_after(self(), {:expire, tag}, rebuilt_state.visibility_timeout)
       end
 
-      {:ok, rebuilt_state}
+      {:ok, %{rebuilt_state | log: log}}
+    else
+      {:ok, empty_state}
     end
   end
 
@@ -374,7 +391,15 @@ defmodule MessageQueue.Queue do
 
   @impl true
   def handle_info(:fsync, state) do
-    MessageQueue.Log.sync(state.log)
+    # `:ok = ...` is load-bearing. If :file.sync fails (disk full, hardware
+    # error), Log.sync returns {:error, reason} and the match crashes the
+    # process. Why crash: a failed fsync means the OS couldn't flush page
+    # cache to disk, so any "successful" append since the last good sync
+    # might be lost. Continuing to ack publishes would be lying. Crashing
+    # surfaces the failure to the supervisor and to publishers (their
+    # GenServer.call returns an exit). Same crash-on-failure stance as
+    # log_op/2 uses for Log.append.
+    :ok = MessageQueue.Log.sync(state.log)
     Process.send_after(self(), :fsync, state.fsync_interval)
     {:noreply, state}
   end
@@ -470,6 +495,7 @@ defmodule MessageQueue.Queue do
       {:ack, tag} ->
         %{state | in_flight: Map.delete(state.in_flight, tag)}
 
+      # two seperate versions for requeue and dlq for auditability only. they behave identically
       {:dlq, tag, envelope} ->
         %{state | in_flight: Map.delete(state.in_flight, tag), dlq: :queue.in(envelope,state.dlq)}
 
@@ -481,6 +507,9 @@ defmodule MessageQueue.Queue do
 
       {:requeue_from_expire, tag, envelope} ->
         %{state | in_flight: Map.delete(state.in_flight, tag), pending: :queue.in(envelope, state.pending)}
+
+      # handle unexpected shapes by crashing loudly with error info
+      other -> raise "MessageQueue.Queue: unknown log entry during replay: #{inspect(other)}"
     end
   end
 end
