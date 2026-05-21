@@ -9,6 +9,46 @@ defmodule MessageQueue.Queue do
   Delivery is at-least-once: a fetched message stays in-flight until the
   consumer acks or nacks it, or until the visibility timeout expires and
   it is redelivered to another consumer.
+
+  ## Durability (Phase 6)
+
+  When started with `durable: true`, the queue writes every state-changing
+  operation to `priv/logs/<name>.log` (via `MessageQueue.Log`) before
+  mutating in-memory state. On restart, `init/1` replays the log to rebuild
+  state. See `MessageQueue.Log` for the on-disk format and entry shapes.
+
+  ### Log-first ordering (invariant)
+
+  **State-changing handlers MUST call `Log.append/2` before mutating
+  state.** This is the write-ahead-log invariant; reordering it silently
+  breaks crash recovery.
+
+  Why: memory is volatile, disk is the source of truth. If the process dies
+  between `append` and mutation, replay restores the op from disk on
+  restart. If the process dies between mutation and `append`, the in-memory
+  change is lost forever — disk has no record of it.
+
+  Affected handlers: `publish`, `fetch` (success branch only), `ack`, `nack`,
+  and the `expire` info handler. Each guards the call with
+  `if state.log != nil` so non-durable queues skip logging at no cost.
+
+  ### Crash recovery is a configurable data-loss window
+
+  `Log.append/2` writes to the OS page cache. The fsync timer flushes that
+  cache to disk every `:fsync_interval` ms (default 100; see `start_link/2`
+  options). On an ungraceful crash (kill, OOM, power loss), up to one
+  interval of recent writes can be lost. `terminate/2` handles graceful
+  shutdown by syncing before closing — but `terminate/2` does NOT run on
+  `:kill` or BEAM crashes, which is why the timer exists.
+
+  ### Append failures crash the handler
+
+  Each handler pattern-matches `:ok = Log.append(...)`. Why: log-first
+  ordering only works if a failed append aborts BEFORE the in-memory
+  mutation. A swallowed `{:error, reason}` would let state advance with no
+  on-disk record — silent durability violation. Crashing the handler
+  surfaces the failure (caller sees an exit) and lets the supervisor
+  decide whether to restart.
   """
 
   use GenServer
@@ -26,6 +66,14 @@ defmodule MessageQueue.Queue do
       `30_000`.
     * `:max_attempts` — number of delivery attempts before a message is
       routed to the dead-letter queue. Default `5`.
+    * `:durable` — when `true`, all state-changing operations are written
+      to `priv/logs/<name>.log` before being applied to in-memory state,
+      and the queue replays the log on init to recover state from prior
+      runs. Default `false` (purely in-memory).
+    * `:fsync_interval` — milliseconds between forced flushes of the log
+      file's OS page cache to disk. Higher = better throughput, larger
+      data-loss window on ungraceful crash. Default `100`. Ignored when
+      `:durable` is `false`.
   """
   def start_link(name, opts \\ []) when is_binary(name) do
     GenServer.start_link(__MODULE__, {name, opts}, name: via(name))
@@ -108,6 +156,28 @@ defmodule MessageQueue.Queue do
 
   #  --- GenServer callbacks ---
 
+  # Boot sequence (durable path):
+  #   1. Open the log file. Crash on error — broken durability is louder
+  #      than a queue that silently runs in-memory when the user asked for
+  #      durable.
+  #   2. Schedule the first fsync. The recurring timer is what protects
+  #      against ungraceful crashes (kill, OOM, power loss); terminate/2
+  #      only covers graceful shutdown.
+  #   3. Replay the log on top of an empty state map. apply_helper/2 is
+  #      the fold function — it knows how to apply each entry shape.
+  #   4. Re-schedule :expire timers for every tag the replay restored to
+  #      in_flight. The original timers died with the previous process.
+  #      Without this, fetched-but-not-acked messages from before the
+  #      crash would be stuck in_flight forever. The new timers use the
+  #      full visibility_timeout — we have no way to know how much had
+  #      already elapsed before the crash, so we give the consumer a
+  #      fresh window.
+  #
+  # Note: max_attempts and visibility_timeout come from opts, not from the
+  # log. Restarting with different values changes how DLQ routing and
+  # redelivery decisions play out post-replay. This is a config-drift
+  # gotcha — if you depend on a specific max_attempts/timeout, ensure
+  # restarts use the same opts the original run did.
   @impl true
   def init({name, opts}) do
     {:ok, log} =
@@ -116,7 +186,8 @@ defmodule MessageQueue.Queue do
         false -> {:ok, nil}
       end
 
-    if log != nil, do: Process.send_after(self(), :fsync, 100)
+    fsync_interval = Keyword.get(opts, :fsync_interval, 100)
+    if log != nil, do: Process.send_after(self(), :fsync, fsync_interval)
 
     empty_state = %{
       pending: :queue.new(),
@@ -125,6 +196,7 @@ defmodule MessageQueue.Queue do
       max_attempts: Keyword.get(opts, :max_attempts, 5),
       in_flight: %{},
       visibility_timeout: Keyword.get(opts, :visibility_timeout, 30_000),
+      fsync_interval: fsync_interval,
       waiters: :queue.new()
     }
 
@@ -132,6 +204,17 @@ defmodule MessageQueue.Queue do
       {:ok, empty_state}
     else
       {:ok, rebuilt_state} = MessageQueue.Log.replay(name, &apply_helper/2, empty_state)
+
+      # Replay restored messages into in_flight (fetched-but-not-acked
+      # before the crash), but no expire timers exist for them — those
+      # timers died with the previous process. Without rescheduling, those
+      # messages would sit in in_flight forever, never timing out for
+      # redelivery. We can't know how much time had already passed before
+      # the crash, so each gets a fresh full visibility_timeout window.
+      for {tag, _envelope} <- rebuilt_state.in_flight do
+        Process.send_after(self(), {:expire, tag}, rebuilt_state.visibility_timeout)
+      end
+
       {:ok, rebuilt_state}
     end
   end
@@ -140,7 +223,7 @@ defmodule MessageQueue.Queue do
   def handle_call({:publish, message}, _from, state) do
     envelope = %{payload: message, attempt_count: 0}
 
-    if state.log != nil, do: MessageQueue.Log.append(state.log, {:publish, envelope})
+    :ok = log_op(state.log, {:publish, envelope})
 
     case :queue.out(state.waiters) do
       {:empty, _} ->
@@ -148,7 +231,19 @@ defmodule MessageQueue.Queue do
         {:reply, :ok, new_state}
 
       {{:value, waiter}, rest} ->
+        # A consumer was already waiting — hand the envelope to them
+        # directly. The envelope skips pending and goes into in_flight
+        # right away, under a fresh delivery tag.
+        #
+        # We've already logged {:publish, envelope} above. But the live
+        # code is now ALSO doing what a fetch would do (move envelope into
+        # in_flight under a tag), so we have to log that too. Without this
+        # extra entry, replay would see only the publish, drop the envelope
+        # into pending, and then crash on the next ack/nack/expire entry
+        # because it references a tag replay never put in in_flight.
         tag = make_ref()
+        :ok = log_op(state.log, {:fetch, tag, envelope})
+
         new_state = %{state | waiters: rest, in_flight: Map.put(state.in_flight, tag, envelope)}
         Process.send_after(self(), {:expire, tag}, state.visibility_timeout)
         GenServer.reply(waiter, {:ok, envelope.payload, tag})
@@ -171,9 +266,13 @@ defmodule MessageQueue.Queue do
         end
 
       {{:value, envelope}, rest} ->
+        # make_ref/0 is durable-safe: refs round-trip through term_to_binary
+        # and compare equal. So a {:fetch, tag, env} entry written here will
+        # decode to the same tag value during replay, and a later
+        # {:ack, tag} entry will match it via Map.pop in apply_helper.
         tag = make_ref()
 
-        if state.log != nil, do: MessageQueue.Log.append(state.log, {:fetch, tag, envelope})
+        :ok = log_op(state.log, {:fetch, tag, envelope})
 
         new_state =
           %{state | pending: rest, in_flight: Map.put(state.in_flight, tag, envelope)}
@@ -187,10 +286,14 @@ defmodule MessageQueue.Queue do
   def handle_call({:ack, tag}, _from, state) do
     case Map.pop(state.in_flight, tag) do
       {nil, _map} ->
+        # The tag isn't in in_flight. Nothing actually changed, so don't
+        # write a log entry — there's no state change to record. (If we
+        # did, replay would later try to ack a tag that's not there and
+        # either no-op silently or crash, depending on which entry it is.)
         {:reply, {:error, :unknown_tag}, state}
 
       {_envelope, rest} ->
-        if state.log != nil, do: MessageQueue.Log.append(state.log, {:ack, tag})
+        :ok = log_op(state.log, {:ack, tag})
         {:reply, :ok, %{state | in_flight: rest}}
     end
   end
@@ -199,10 +302,11 @@ defmodule MessageQueue.Queue do
   def handle_call({:nack, tag, opts}, _from, state) do
     case Map.pop(state.in_flight, tag) do
       {nil, _rest} ->
+        # Tag not in in_flight — no state change, no log entry. Same
+        # reasoning as in the ack handler.
         {:reply, {:error, :unknown_tag}, state}
 
       {envelope, rest} ->
-        if state.log != nil, do: MessageQueue.Log.append(state.log, {:nack, tag, opts})
         new_state = %{state | in_flight: rest}
 
         case Keyword.get(opts, :requeue, true) do
@@ -210,12 +314,15 @@ defmodule MessageQueue.Queue do
             envelope = Map.update!(envelope, :attempt_count, fn val -> val + 1 end)
 
             if envelope.attempt_count >= state.max_attempts do
+              :ok = log_op(state.log, {:dlq, tag, envelope})
               {:reply, :ok, %{new_state | dlq: :queue.in(envelope, new_state.dlq)}}
             else
+              :ok = log_op(state.log, {:requeue, tag, envelope})
               {:reply, :ok, %{new_state | pending: :queue.in(envelope, new_state.pending)}}
             end
 
           false ->
+            :ok = log_op(state.log, {:dlq, tag, envelope})
             {:reply, :ok, %{new_state | dlq: :queue.in(envelope, new_state.dlq)}}
         end
     end
@@ -235,16 +342,20 @@ defmodule MessageQueue.Queue do
   def handle_info({:expire, tag}, state) do
     case Map.pop(state.in_flight, tag) do
       {nil, _rest} ->
+        # The timer fired but the consumer already acked or nacked this
+        # tag before the timeout — so it's no longer in in_flight.
+        # Common and harmless. No state change, no log entry.
         {:noreply, state}
 
       {envelope, rest} ->
-        if state.log != nil, do: MessageQueue.Log.append(state.log, {:expire, tag})
         new_state = %{state | in_flight: rest}
         envelope = Map.update!(envelope, :attempt_count, fn val -> val + 1 end)
 
         if envelope.attempt_count >= state.max_attempts do
+          :ok = log_op(state.log, {:dlq_from_expire, tag, envelope})
           {:noreply, %{new_state | dlq: :queue.in(envelope, new_state.dlq)}}
         else
+          :ok = log_op(state.log, {:requeue_from_expire, tag, envelope})
           {:noreply, %{new_state | pending: :queue.in(envelope, new_state.pending)}}
         end
     end
@@ -264,16 +375,26 @@ defmodule MessageQueue.Queue do
   @impl true
   def handle_info(:fsync, state) do
     MessageQueue.Log.sync(state.log)
-    Process.send_after(self(), :fsync, 100)
+    Process.send_after(self(), :fsync, state.fsync_interval)
     {:noreply, state}
   end
 
+  # terminate/2 runs on graceful shutdown only:
+  #   - supervisor-initiated stop
+  #   - GenServer returns {:stop, reason, state}
+  #   - linked parent dies with :trap_exit set
+  #
+  # It does NOT run on Process.exit(pid, :kill), BEAM crashes, OOM kills,
+  # or power loss. Those paths rely on the periodic fsync (handle_info/2
+  # :fsync clause) having flushed recent writes. Do not delete the fsync
+  # timer thinking just terminate is sufficient.
   @impl true
   def terminate(_reason, state) do
     if state.log != nil do
       MessageQueue.Log.sync(state.log)
       MessageQueue.Log.close(state.log)
     end
+
     :ok
   end
 
@@ -283,46 +404,83 @@ defmodule MessageQueue.Queue do
     {:via, Registry, {MessageQueue.Registry, name}}
   end
 
+  # The one place we write entries to the log file. Two jobs:
+  #
+  #   1. If the queue isn't durable (no log file), do nothing.
+  #   2. If it IS durable and the write fails, crash this process.
+  #
+  # The `:ok = ...` is what makes #2 happen. Log.append/2 returns either
+  # `:ok` (write succeeded) or `{:error, reason}` (disk full, file gone,
+  # etc.). Using `=` as a pattern match means: if the right side isn't
+  # exactly `:ok`, the match fails and the process dies with MatchError.
+  #
+  # Why crash instead of just ignoring the error: if we ignored it, the
+  # handler would then go ahead and update the in-memory queue state.
+  # Now memory has a change that disk has no record of. On crash and
+  # restart, replay rebuilds from disk — so the change is gone. The whole
+  # point of "log first, then mutate" is to never let memory get ahead of
+  # disk. Crashing the handler keeps that promise: if we couldn't write,
+  # we don't mutate.
+  defp log_op(nil, _entry), do: :ok
+  defp log_op(handle, entry), do: :ok = MessageQueue.Log.append(handle, entry)
+
+  # Replay's rule-book. Called by Log.replay/3 once per log entry while
+  # rebuilding state on boot. For each kind of entry, this says how to
+  # update the in-memory state.
+  #
+  # Same shape as the live handlers above, minus three things they do:
+  #
+  #   - Replying to callers. There is no caller during replay — we're
+  #     reading historical events off disk, not handling live requests.
+  #   - Scheduling timers. The original timers already fired (or didn't)
+  #     before the crash. Replay is not "running the queue again," it's
+  #     just rebuilding state. Fresh expire timers for messages still in
+  #     in_flight at the end of replay are scheduled by init/1 itself
+  #     (see the for-loop after the replay call).
+  #   - Touching waiters. Waiters exist only while the queue is running.
+  #     During boot, nobody is parked yet.
+  #
+  # Replay starts from the empty state that init/1 just built. So
+  # waiters, max_attempts, visibility_timeout, and fsync_interval all
+  # come from opts passed to start_link — never from the log.
   defp apply_helper(entry, state) do
     case entry do
       {:publish, envelope} ->
         %{state | pending: :queue.in(envelope, state.pending)}
 
       {:fetch, tag, envelope} ->
-        {{:value, _envelope}, rest} = :queue.out(state.pending)
+        # Defensive: this pin (`^envelope`) does nothing under correct
+        # operation. The live fetch handler always pops the same envelope
+        # the publish handler put in pending, so the log entries match the
+        # state precisely. The pin is here to catch FUTURE breakage:
+        #
+        #   - If a new bug elsewhere causes an entry to land in the log
+        #     without matching state changes (a la the publish-to-waiter
+        #     bug we fixed), the pending head can drift from the logged
+        #     envelope. Without the pin, replay silently produces a wrong
+        #     state and the bug surfaces much later in mysterious ways.
+        #   - If the log file is corrupted (bit flip, hand-editing, bad
+        #     disk), one entry's envelope can disagree with another's.
+        #
+        # The pin makes any such drift crash here with MatchError instead
+        # of being absorbed quietly. Cheap insurance, no runtime cost.
+        {{:value, ^envelope}, rest} = :queue.out(state.pending)
         %{state | pending: rest, in_flight: Map.put(state.in_flight, tag, envelope)}
 
       {:ack, tag} ->
         %{state | in_flight: Map.delete(state.in_flight, tag)}
 
-      {:nack, tag, opts} ->
-        {envelope, rest} = Map.pop(state.in_flight, tag)
-        new_state = %{state | in_flight: rest}
+      {:dlq, tag, envelope} ->
+        %{state | in_flight: Map.delete(state.in_flight, tag), dlq: :queue.in(envelope,state.dlq)}
 
-        case Keyword.get(opts, :requeue, true) do
-          true ->
-            envelope = Map.update!(envelope, :attempt_count, fn val -> val + 1 end)
+      {:requeue, tag, envelope} ->
+        %{state | in_flight: Map.delete(state.in_flight, tag), pending: :queue.in(envelope, state.pending)}
 
-            if envelope.attempt_count >= state.max_attempts do
-              %{new_state | dlq: :queue.in(envelope, new_state.dlq)}
-            else
-              %{new_state | pending: :queue.in(envelope, new_state.pending)}
-            end
+      {:dlq_from_expire, tag, envelope} ->
+        %{state | in_flight: Map.delete(state.in_flight, tag), dlq: :queue.in(envelope,state.dlq)}
 
-          false ->
-            %{new_state | dlq: :queue.in(envelope, new_state.dlq)}
-        end
-
-      {:expire, tag} ->
-        {envelope, rest} = Map.pop(state.in_flight, tag)
-        new_state = %{state | in_flight: rest}
-        envelope = Map.update!(envelope, :attempt_count, fn val -> val + 1 end)
-
-        if envelope.attempt_count >= state.max_attempts do
-          %{new_state | dlq: :queue.in(envelope, new_state.dlq)}
-        else
-          %{new_state | pending: :queue.in(envelope, new_state.pending)}
-        end
+      {:requeue_from_expire, tag, envelope} ->
+        %{state | in_flight: Map.delete(state.in_flight, tag), pending: :queue.in(envelope, state.pending)}
     end
   end
 end
