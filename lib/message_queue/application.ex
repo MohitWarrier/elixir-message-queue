@@ -12,7 +12,10 @@ defmodule MessageQueue.Application do
 
       # DynamicSupervisor that owns queue processes. Starts them on demand
       # and restarts them automatically on crash.
-      MessageQueue.QueueSupervisor
+      MessageQueue.QueueSupervisor,
+
+      # HTTP server. Bandit runs the Plug router on port 4000.
+      {Bandit, plug: MessageQueue.HTTP.Router, port: 4000}
     ]
 
     opts = [strategy: :one_for_one, name: MessageQueue.Supervisor]

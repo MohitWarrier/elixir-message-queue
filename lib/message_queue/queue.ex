@@ -497,19 +497,36 @@ defmodule MessageQueue.Queue do
 
       # two seperate versions for requeue and dlq for auditability only. they behave identically
       {:dlq, tag, envelope} ->
-        %{state | in_flight: Map.delete(state.in_flight, tag), dlq: :queue.in(envelope,state.dlq)}
+        %{
+          state
+          | in_flight: Map.delete(state.in_flight, tag),
+            dlq: :queue.in(envelope, state.dlq)
+        }
 
       {:requeue, tag, envelope} ->
-        %{state | in_flight: Map.delete(state.in_flight, tag), pending: :queue.in(envelope, state.pending)}
+        %{
+          state
+          | in_flight: Map.delete(state.in_flight, tag),
+            pending: :queue.in(envelope, state.pending)
+        }
 
       {:dlq_from_expire, tag, envelope} ->
-        %{state | in_flight: Map.delete(state.in_flight, tag), dlq: :queue.in(envelope,state.dlq)}
+        %{
+          state
+          | in_flight: Map.delete(state.in_flight, tag),
+            dlq: :queue.in(envelope, state.dlq)
+        }
 
       {:requeue_from_expire, tag, envelope} ->
-        %{state | in_flight: Map.delete(state.in_flight, tag), pending: :queue.in(envelope, state.pending)}
+        %{
+          state
+          | in_flight: Map.delete(state.in_flight, tag),
+            pending: :queue.in(envelope, state.pending)
+        }
 
       # handle unexpected shapes by crashing loudly with error info
-      other -> raise "MessageQueue.Queue: unknown log entry during replay: #{inspect(other)}"
+      other ->
+        raise "MessageQueue.Queue: unknown log entry during replay: #{inspect(other)}"
     end
   end
 end

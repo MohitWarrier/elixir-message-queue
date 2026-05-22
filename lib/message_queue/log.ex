@@ -242,8 +242,7 @@ defmodule MessageQueue.Log do
   can't actually guarantee.
   """
   @spec sync(handle()) :: :ok | {:error, term()}
-   def sync(handle) do
-
+  def sync(handle) do
     :file.sync(handle)
   end
 
@@ -320,15 +319,20 @@ defmodule MessageQueue.Log do
             entry = :erlang.binary_to_term(payload, [:safe])
             new_acc = fun.(entry, acc)
             do_replay(fd, fun, new_acc, last_good_pos + 4 + n)
-          _ -> # torn payload
+
+          # torn payload
+          _ ->
             truncate(fd, last_good_pos)
             {:ok, acc}
         end
 
-      {:ok, _partial} -> # torn header
+      # torn header
+      {:ok, _partial} ->
         truncate(fd, last_good_pos)
         {:ok, acc}
-      :eof -> {:ok, acc}
+
+      :eof ->
+        {:ok, acc}
     end
   end
 

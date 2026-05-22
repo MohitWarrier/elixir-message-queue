@@ -27,8 +27,11 @@ defmodule MessageQueue.QueueDurabilityTest do
     name = "dur_q_" <> Integer.to_string(System.unique_integer([:positive]))
     {:ok, path} = MessageQueue.Log.path_for(name)
 
+    # Wipe any stale log left over from a previous run with the same name —
+    # System.unique_integer/1 resets across BEAM restarts so collisions happen.
+    File.rm(path)
+
     on_exit(fn ->
-      # Best-effort: stop the supervised process before deleting its file.
       case Registry.lookup(MessageQueue.Registry, name) do
         [{pid, _}] -> graceful_stop(pid)
         _ -> :ok
