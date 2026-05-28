@@ -8,10 +8,18 @@ defmodule MessageQueue.HTTP.Tag do
     :erlang.term_to_binary(ref) |> Base.url_encode64(padding: false)
   end
 
+  # term_to_binary of a make_ref() produces ~25 bytes. 64 is a comfortable
+  # ceiling. Without this, a client could base64-encode a 10 MB term and force
+  # BEAM to allocate it before is_reference/1 rejects it — memory exhaustion.
+  @max_decoded_bytes 64
+
   @spec decode(String.t()) :: {:ok, reference()} | :error
   def decode(string) do
     case Base.url_decode64(string, padding: false) do
       :error ->
+        :error
+
+      {:ok, binary} when byte_size(binary) > @max_decoded_bytes ->
         :error
 
       {:ok, binary} ->
@@ -23,7 +31,7 @@ defmodule MessageQueue.HTTP.Tag do
           end
         rescue
           ArgumentError -> :error
-      end
+        end
     end
   end
 end

@@ -67,6 +67,7 @@ defmodule MessageQueue.Queue do
       `30_000`.
     * `:max_attempts` — number of delivery attempts before a message is
       routed to the dead-letter queue. Default `5`.
+    * `:compact_threshold` — number of operations before log file compaction takes place.
     * `:durable` — when `true`, all state-changing operations are written
       to `priv/logs/<name>.log` before being applied to in-memory state,
       and the queue replays the log on init to recover state from prior
@@ -190,14 +191,22 @@ defmodule MessageQueue.Queue do
     # Build the empty state with log: nil. For durable queues we'll fill
     # in the log handle AFTER replay finishes (see below).
     empty_state = %{
+      name: name,
       pending: :queue.new(),
       dlq: :queue.new(),
       log: nil,
       max_attempts: Keyword.get(opts, :max_attempts, 5),
       in_flight: %{},
+      ops_since_compact: 0,
+      compaction_pending: false,
+      compact_threshold: Keyword.get(opts, :compact_threshold, 10_000),
       visibility_timeout: Keyword.get(opts, :visibility_timeout, 30_000),
       fsync_interval: fsync_interval,
-      waiters: :queue.new()
+      waiters: :queue.new(),
+      # Only read during init/1 right after replay finishes. Counts entries
+      # the replay walked, so we can compare against live state size and
+      # decide whether to compact immediately.
+      replay_entry_count: 0
     }
 
     if durable? do
@@ -230,7 +239,26 @@ defmodule MessageQueue.Queue do
         Process.send_after(self(), {:expire, tag}, rebuilt_state.visibility_timeout)
       end
 
-      {:ok, %{rebuilt_state | log: log}}
+      # If the on-disk log is much bigger than the live state we just rebuilt,
+      # trigger compaction immediately. Without this, a queue that crashed with
+      # a 2 GB stale log replays the full thing on EVERY restart and won't
+      # compact until 10k more ops happen. Heuristic: live entry count is
+      # pending + 2*in_flight + 3*dlq (what compaction would emit). If the
+      # number of entries actually replayed is more than 2x that, compact now.
+      live_entries =
+        :queue.len(rebuilt_state.pending) +
+          2 * map_size(rebuilt_state.in_flight) +
+          3 * :queue.len(rebuilt_state.dlq)
+
+      state =
+        if rebuilt_state.replay_entry_count > 2 * live_entries + 100 do
+          send(self(), :compact)
+          %{rebuilt_state | log: log, compaction_pending: true}
+        else
+          %{rebuilt_state | log: log}
+        end
+
+      {:ok, state}
     else
       {:ok, empty_state}
     end
@@ -240,7 +268,7 @@ defmodule MessageQueue.Queue do
   def handle_call({:publish, message}, _from, state) do
     envelope = %{payload: message, attempt_count: 0}
 
-    :ok = log_op(state.log, {:publish, envelope})
+    state = log_op(state, {:publish, envelope})
 
     case :queue.out(state.waiters) do
       {:empty, _} ->
@@ -259,7 +287,7 @@ defmodule MessageQueue.Queue do
         # into pending, and then crash on the next ack/nack/expire entry
         # because it references a tag replay never put in in_flight.
         tag = make_ref()
-        :ok = log_op(state.log, {:fetch, tag, envelope})
+        state = log_op(state, {:fetch, tag, envelope})
 
         new_state = %{state | waiters: rest, in_flight: Map.put(state.in_flight, tag, envelope)}
         Process.send_after(self(), {:expire, tag}, state.visibility_timeout)
@@ -289,7 +317,7 @@ defmodule MessageQueue.Queue do
         # {:ack, tag} entry will match it via Map.pop in apply_helper.
         tag = make_ref()
 
-        :ok = log_op(state.log, {:fetch, tag, envelope})
+        state = log_op(state, {:fetch, tag, envelope})
 
         new_state =
           %{state | pending: rest, in_flight: Map.put(state.in_flight, tag, envelope)}
@@ -310,7 +338,7 @@ defmodule MessageQueue.Queue do
         {:reply, {:error, :unknown_tag}, state}
 
       {_envelope, rest} ->
-        :ok = log_op(state.log, {:ack, tag})
+        state = log_op(state, {:ack, tag})
         {:reply, :ok, %{state | in_flight: rest}}
     end
   end
@@ -324,23 +352,23 @@ defmodule MessageQueue.Queue do
         {:reply, {:error, :unknown_tag}, state}
 
       {envelope, rest} ->
-        new_state = %{state | in_flight: rest}
-
         case Keyword.get(opts, :requeue, true) do
           true ->
             envelope = Map.update!(envelope, :attempt_count, fn val -> val + 1 end)
 
             if envelope.attempt_count >= state.max_attempts do
-              :ok = log_op(state.log, {:dlq, tag, envelope})
-              {:reply, :ok, %{new_state | dlq: :queue.in(envelope, new_state.dlq)}}
+              state = log_op(state, {:dlq, tag, envelope})
+              {:reply, :ok, %{state | in_flight: rest, dlq: :queue.in(envelope, state.dlq)}}
             else
-              :ok = log_op(state.log, {:requeue, tag, envelope})
-              {:reply, :ok, %{new_state | pending: :queue.in(envelope, new_state.pending)}}
+              state = log_op(state, {:requeue, tag, envelope})
+
+              {:reply, :ok,
+               %{state | in_flight: rest, pending: :queue.in(envelope, state.pending)}}
             end
 
           false ->
-            :ok = log_op(state.log, {:dlq, tag, envelope})
-            {:reply, :ok, %{new_state | dlq: :queue.in(envelope, new_state.dlq)}}
+            state = log_op(state, {:dlq, tag, envelope})
+            {:reply, :ok, %{state | in_flight: rest, dlq: :queue.in(envelope, state.dlq)}}
         end
     end
   end
@@ -365,15 +393,14 @@ defmodule MessageQueue.Queue do
         {:noreply, state}
 
       {envelope, rest} ->
-        new_state = %{state | in_flight: rest}
         envelope = Map.update!(envelope, :attempt_count, fn val -> val + 1 end)
 
         if envelope.attempt_count >= state.max_attempts do
-          :ok = log_op(state.log, {:dlq_from_expire, tag, envelope})
-          {:noreply, %{new_state | dlq: :queue.in(envelope, new_state.dlq)}}
+          state = log_op(state, {:dlq_from_expire, tag, envelope})
+          {:noreply, %{state | in_flight: rest, dlq: :queue.in(envelope, state.dlq)}}
         else
-          :ok = log_op(state.log, {:requeue_from_expire, tag, envelope})
-          {:noreply, %{new_state | pending: :queue.in(envelope, new_state.pending)}}
+          state = log_op(state, {:requeue_from_expire, tag, envelope})
+          {:noreply, %{state | in_flight: rest, pending: :queue.in(envelope, state.pending)}}
         end
     end
   end
@@ -402,6 +429,12 @@ defmodule MessageQueue.Queue do
     :ok = MessageQueue.Log.sync(state.log)
     Process.send_after(self(), :fsync, state.fsync_interval)
     {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(:compact, state) do
+    new_log_handle = compact!(state)
+    {:noreply, %{state | log: new_log_handle, ops_since_compact: 0, compaction_pending: false}}
   end
 
   # terminate/2 runs on graceful shutdown only:
@@ -446,8 +479,21 @@ defmodule MessageQueue.Queue do
   # point of "log first, then mutate" is to never let memory get ahead of
   # disk. Crashing the handler keeps that promise: if we couldn't write,
   # we don't mutate.
-  defp log_op(nil, _entry), do: :ok
-  defp log_op(handle, entry), do: :ok = MessageQueue.Log.append(handle, entry)
+  defp log_op(state, entry) do
+    if state.log == nil do
+      state
+    else
+      :ok = MessageQueue.Log.append(state.log, entry)
+      new_count = state.ops_since_compact + 1
+
+      if new_count >= state.compact_threshold and not state.compaction_pending do
+        send(self(), :compact)
+        %{state | ops_since_compact: new_count, compaction_pending: true}
+      else
+        %{state | ops_since_compact: new_count}
+      end
+    end
+  end
 
   # Replay's rule-book. Called by Log.replay/3 once per log entry while
   # rebuilding state on boot. For each kind of entry, this says how to
@@ -469,6 +515,10 @@ defmodule MessageQueue.Queue do
   # waiters, max_attempts, visibility_timeout, and fsync_interval all
   # come from opts passed to start_link — never from the log.
   defp apply_helper(entry, state) do
+    # Bump the replayed-entry counter on every call; init/1 reads it after
+    # replay finishes to decide whether to trigger immediate compaction.
+    state = %{state | replay_entry_count: state.replay_entry_count + 1}
+
     case entry do
       {:publish, envelope} ->
         %{state | pending: :queue.in(envelope, state.pending)}
@@ -528,5 +578,46 @@ defmodule MessageQueue.Queue do
       other ->
         raise "MessageQueue.Queue: unknown log entry during replay: #{inspect(other)}"
     end
+  end
+
+  defp compact!(state) do
+    # close the live handler, os might not be able to rename open ones
+    MessageQueue.Log.close(state.log)
+
+    {:ok, live_path} = MessageQueue.Log.path_for(state.name)
+    temp_path = live_path <> ".compact"
+
+    {:ok, temp} = :file.open(temp_path, [:write, :binary, :raw])
+
+    # ORDER MATTERS. apply_helper's :fetch clause (queue.ex line ~492) pins
+    # the head of pending to equal the fetch's envelope. So every publish we
+    # emit for an in_flight or dlq message MUST be consumed by its matching
+    # fetch immediately, before any other publish lands at the head of
+    # pending. That means in_flight and dlq go first (each publish is paired
+    # with a fetch that pops it back out), and pending goes last (its
+    # publishes accumulate and stay).
+    for {tag, env} <- state.in_flight do
+      :ok = MessageQueue.Log.append(temp, {:publish, env})
+      :ok = MessageQueue.Log.append(temp, {:fetch, tag, env})
+    end
+
+    for env <- :queue.to_list(state.dlq) do
+      tag = make_ref()
+      :ok = MessageQueue.Log.append(temp, {:publish, env})
+      :ok = MessageQueue.Log.append(temp, {:fetch, tag, env})
+      :ok = MessageQueue.Log.append(temp, {:dlq, tag, env})
+    end
+
+    for env <- :queue.to_list(state.pending),
+        do: :ok = MessageQueue.Log.append(temp, {:publish, env})
+
+    :ok = :file.sync(temp)
+    :ok = :file.close(temp)
+
+    :ok = :file.rename(temp_path, live_path)
+
+    {:ok, new_log} = MessageQueue.Log.open(state.name)
+    # return value, becomes state.log in handle_info
+    new_log
   end
 end
