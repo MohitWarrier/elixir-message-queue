@@ -279,6 +279,41 @@ defmodule MessageQueue.QueueCompactionTest do
       # (the compacted log re-wrote {:fetch, original_tag, env}). Ack should still work.
       assert :ok = MessageQueue.ack(name, original_tag)
     end
+
+    test "init/1 triggers compaction when the on-disk log dwarfs the live state",
+         %{name: name, path: path} do
+      # compact_threshold set to a huge value so runtime compaction NEVER fires
+      # during the loop. We want the file to grow unchecked, then verify init's
+      # post-replay heuristic shrinks it on restart.
+      :ok = MessageQueue.ensure_queue(name, durable: true, compact_threshold: 1_000_000)
+
+      # 200 publish-fetch-ack cycles = 600 log entries. All cancel out, so live
+      # state ends empty.
+      for j <- 1..200 do
+        :ok = MessageQueue.publish(name, {:gone, j})
+        {:ok, _msg, tag} = MessageQueue.fetch(name)
+        :ok = MessageQueue.ack(name, tag)
+      end
+
+      # Force a graceful shutdown so terminate/2 fsyncs before close — we want
+      # all 600 entries actually persisted to disk for the restart to replay.
+      size_before = File.stat!(path).size
+      assert size_before > 10_000, "expected log to bloat without runtime compaction"
+
+      graceful_restart(name)
+
+      # init/1's post-replay heuristic should have sent :compact (600 replayed
+      # entries vs live state of 0). The post-init :compact message runs once
+      # the GenServer becomes ready. Wait for the flag to clear.
+      wait_for_no_pending_compact(name)
+
+      size_after = File.stat!(path).size
+      # Live state is empty after replay, so a compacted file should be tiny
+      # (a few hundred bytes max).
+      assert size_after < size_before / 10,
+             "expected init-triggered compaction to shrink the file dramatically; " <>
+               "before=#{size_before} after=#{size_after}"
+    end
   end
 
   # --- Helpers ---
